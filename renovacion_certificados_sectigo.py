@@ -84,11 +84,12 @@ LOGS
 ------------------------------------------------------------------
 SUPUESTOS QUE HAY QUE VALIDAR ANTES DE CONFIAR ESTO A LOS 400 CERTIFICADOS
 ------------------------------------------------------------------
-  - El código de formato exacto para descargar el PKCS#7 por API no
-    está confirmado contra esta instancia. El script prueba varios
-    candidatos conocidos (ver COLLECT_FORMAT_CANDIDATES) y reporta
-    cuál funcionó. Corran una vez con --descubrir-formato y fijen el
-    resultado en la variable de entorno SCM_COLLECT_FORMAT.
+  - Confirmado contra hard.cert-manager.com (gruposura): esta instancia
+    NO soporta PKCS7 por API (error -1450 "Unsupported certificate
+    format"). El script descarga el certificado hoja (x509CO) y la
+    cadena de CAs (x509IOR) por separado y las concatena en un .pem —
+    si migran a otra instancia de SCM, verifiquen si ahí sí soporta
+    PKCS7 o si aplica el mismo esquema.
   - notificar_dominio_no_validado() es un stub: conecten aquí su SMTP
     real o su canal de notificaciones (Teams, correo, etc.).
   - El tamaño de llave por defecto es RSA 2048 (coincide con lo que
@@ -128,10 +129,18 @@ KEY_SIZE_DEFAULT = 2048
 VENTANA_RENOVACION_DIAS_DEFAULT = 30
 COLLECT_MAX_INTENTOS = 20
 COLLECT_ESPERA_SEGUNDOS = 30
+TIMEOUT_HTTP_SEGUNDOS = 30  # ninguna llamada HTTP debe poder colgarse indefinidamente
 
 CERT_PROFILE_NOMBRE_DEFAULT = "Instant SSL Certificate"
 
-COLLECT_FORMAT_CANDIDATES = ["pkcs7", "PKCS7", "x509CO"]
+# Confirmado contra esta instancia de SCM: PKCS7 no está soportado
+# (error -1450 "Unsupported certificate format"). Solo los formatos
+# x509* funcionan. Se descarga el certificado hoja y la cadena de
+# CAs por separado, y se concatenan en un solo .pem — mismo
+# resultado que el .p7b -> .pem del proceso manual, sin pasar por
+# PKCS7 en ningún momento.
+CERT_FORMAT_HOJA = "x509CO"
+CERT_FORMAT_CADENA = "x509IOR"
 
 # Caracteres especiales confirmados como permitidos en la contraseña
 # del .pfx. Se excluyen a propósito: . , : ; ' " \ / | _ -
@@ -287,13 +296,13 @@ class ClienteSCM:
 
     def _get(self, path: str, **kwargs) -> requests.Response:
         log.debug(f"GET {path} params={kwargs.get('params')}")
-        r = self.session.get(f"{self.config.base_url}{path}", **kwargs)
+        r = self.session.get(f"{self.config.base_url}{path}", timeout=TIMEOUT_HTTP_SEGUNDOS, **kwargs)
         log.debug(f"-> {r.status_code} ({len(r.content)} bytes)")
         return r
 
     def _post(self, path: str, json_body: dict) -> requests.Response:
         log.debug(f"POST {path}")
-        r = self.session.post(f"{self.config.base_url}{path}", json=json_body)
+        r = self.session.post(f"{self.config.base_url}{path}", json=json_body, timeout=TIMEOUT_HTTP_SEGUNDOS)
         log.debug(f"-> {r.status_code}")
         return r
 
@@ -348,26 +357,58 @@ class ClienteSCM:
     def collect(self, ssl_id: int, formato: str) -> bytes:
         r = self._get(f"/api/ssl/v1/collect/{ssl_id}/{formato}")
         if r.status_code == 400:
+            # Sectigo devuelve 400 tanto para "aún pendiente" como para
+            # errores reales (formato no soportado, etc.). Se distingue
+            # por el código: todos los errores reales que hemos visto
+            # de esta API (-16, -1032, -1450...) traen un "code"
+            # negativo explícito. Si aparece ese código, es un error
+            # permanente y no tiene sentido reintentar.
+            try:
+                cuerpo = r.json()
+            except ValueError:
+                cuerpo = None
+            if isinstance(cuerpo, dict) and isinstance(cuerpo.get("code"), int) and cuerpo["code"] < 0:
+                raise SCMError(
+                    f"SCM rechazó el formato/solicitud (no es un estado pendiente): "
+                    f"code={cuerpo.get('code')} description={cuerpo.get('description')}"
+                )
             raise CertificadoPendienteError(r.text)
         if r.status_code != 200:
             raise SCMError(f"Fallo al descargar el certificado {ssl_id}: {r.status_code} {r.text}")
         return r.content
 
-    def descubrir_formato_collect(self, ssl_id: int) -> str:
-        for formato in COLLECT_FORMAT_CANDIDATES:
+    def descargar_certificado_completo(self, ssl_id: int) -> tuple[bytes, bytes]:
+        """
+        Descarga el certificado hoja y la cadena de CAs por separado
+        (esta instancia de SCM no soporta PKCS7, ver CERT_FORMAT_HOJA /
+        CERT_FORMAT_CADENA). Espera con reintentos solo en la parte
+        del certificado hoja, que es la que puede estar genuinamente
+        pendiente justo después del enroll.
+        """
+        contenido_hoja = None
+        for intento in range(1, COLLECT_MAX_INTENTOS + 1):
             try:
-                contenido = self.collect(ssl_id, formato)
-                if contenido:
-                    log.info(f"[descubrir-formato] '{formato}' funcionó. "
-                             f"Fija SCM_COLLECT_FORMAT={formato} para no repetir esta prueba.")
-                    return formato
-            except (SCMError, CertificadoPendienteError):
-                continue
-        raise SCMError(
-            "Ninguno de los formatos candidatos funcionó. Prueba manualmente en "
-            "Postman contra /api/ssl/v1/collect/{sslId}/{formato} con distintos "
-            "valores y actualiza COLLECT_FORMAT_CANDIDATES."
-        )
+                contenido_hoja = self.collect(ssl_id, CERT_FORMAT_HOJA)
+                break
+            except CertificadoPendienteError as e:
+                log.info(f"Certificado aún pendiente (intento {intento}/{COLLECT_MAX_INTENTOS}). "
+                         f"Motivo de Sectigo: {e}. Reintentando en {COLLECT_ESPERA_SEGUNDOS}s...")
+                time.sleep(COLLECT_ESPERA_SEGUNDOS)
+
+        if contenido_hoja is None:
+            raise SCMError(
+                f"El certificado {ssl_id} sigue pendiente tras {COLLECT_MAX_INTENTOS} intentos."
+            )
+
+        try:
+            contenido_cadena = self.collect(ssl_id, CERT_FORMAT_CADENA)
+        except (SCMError, CertificadoPendienteError) as e:
+            log.warning(f"No se pudo descargar la cadena de CAs ({CERT_FORMAT_CADENA}): {e}. "
+                        f"Se continúa solo con el certificado hoja — revisa esto antes de "
+                        f"confiar el .pfx a producción, puede faltar la cadena intermedia.")
+            contenido_cadena = b""
+
+        return contenido_hoja, contenido_cadena
 
     # ---- Dominios ----------------------------------------------------
 
@@ -452,18 +493,24 @@ class ClienteNetScaler:
                 "fileencoding": "BASE64",
             }]
         }
+        log.debug(f"[NetScaler] POST {self.base_url}/systemfile "
+                  f"filename={nombre_archivo} filelocation={filelocation} "
+                  f"({len(contenido)} bytes)")
         r = requests.post(f"{self.base_url}/systemfile", json=body,
                            auth=self.auth, headers=self._headers(),
-                           verify=self.config.verificar_tls)
+                           verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
+        log.debug(f"[NetScaler] -> {r.status_code}")
         if r.status_code not in (200, 201):
             raise NetScalerError(f"No se pudo subir {nombre_archivo} a {filelocation}: "
                                   f"{r.status_code} {r.text}")
         log.info(f"[NetScaler] Archivo subido: {filelocation}/{nombre_archivo}")
 
     def certkey_existe(self, certkey: str) -> bool:
+        log.debug(f"[NetScaler] GET {self.base_url}/sslcertkey/{certkey}")
         r = requests.get(f"{self.base_url}/sslcertkey/{certkey}",
                           auth=self.auth, headers=self._headers(),
-                          verify=self.config.verificar_tls)
+                          verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
+        log.debug(f"[NetScaler] -> {r.status_code}")
         return r.status_code == 200
 
     def crear_o_actualizar_certkey(self, certkey: str, nombre_archivo: str,
@@ -476,27 +523,37 @@ class ClienteNetScaler:
             "password": True,
             "passplain": password_pfx,
         }
+        # No se registra passplain en el log, ni siquiera en DEBUG.
+        cuerpo_para_log = {k: v for k, v in cuerpo_certkey.items() if k != "passplain"}
 
         if self.certkey_existe(certkey):
             log.info(f"[NetScaler] '{certkey}' ya existe: se actualiza (renovación in-place).")
-            r = requests.put(f"{self.base_url}/sslcertkey", json={"sslcertkey": cuerpo_certkey},
-                              auth=self.auth, headers=self._headers(),
-                              verify=self.config.verificar_tls)
+            # NITRO exige POST + ?action=update para esto, no un PUT plano —
+            # confirmado con error 278 "Invalid argument [cert]" al probar PUT.
+            log.debug(f"[NetScaler] POST {self.base_url}/sslcertkey?action=update body={cuerpo_para_log}")
+            r = requests.post(f"{self.base_url}/sslcertkey?action=update",
+                               json={"sslcertkey": cuerpo_certkey},
+                               auth=self.auth, headers=self._headers(),
+                               verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
         else:
             log.info(f"[NetScaler] '{certkey}' no existe: se crea nuevo.")
+            log.debug(f"[NetScaler] POST {self.base_url}/sslcertkey body={cuerpo_para_log}")
             r = requests.post(f"{self.base_url}/sslcertkey", json={"sslcertkey": cuerpo_certkey},
                                auth=self.auth, headers=self._headers(),
-                               verify=self.config.verificar_tls)
+                               verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
 
+        log.debug(f"[NetScaler] -> {r.status_code}")
         if r.status_code not in (200, 201):
             raise NetScalerError(f"No se pudo crear/actualizar sslcertkey '{certkey}': "
                                   f"{r.status_code} {r.text}")
         log.info(f"[NetScaler] sslcertkey '{certkey}' OK.")
 
     def guardar_configuracion(self) -> None:
-        r = requests.post(f"{self.base_url}/nsconfig?action=save", json={},
+        log.debug(f"[NetScaler] POST {self.base_url}/nsconfig?action=save")
+        r = requests.post(f"{self.base_url}/nsconfig?action=save", json={"nsconfig": {}},
                            auth=self.auth, headers=self._headers(),
-                           verify=self.config.verificar_tls)
+                           verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
+        log.debug(f"[NetScaler] -> {r.status_code}")
         if r.status_code not in (200, 201):
             raise NetScalerError(f"No se pudo guardar la configuración: {r.status_code} {r.text}")
         log.info("[NetScaler] Configuración guardada (save ns config).")
@@ -524,6 +581,58 @@ def subir_a_netscaler(ruta_pfx: Path, password_pfx: str, certkey: str) -> None:
 # ============================================================
 # LÓGICA DE NEGOCIO
 # ============================================================
+
+def extraer_perfil_certificado(cert: dict) -> tuple[int, str]:
+    """
+    El endpoint de listado de SCM (/api/ssl/v1) devuelve el perfil como
+    campos planos: certTypeId, certTypeName. El endpoint de detalle de
+    un certificado puntual (/api/ssl/v1/{sslId}) puede devolverlo
+    anidado en su lugar: certType: {id, name}. Esta función tolera
+    ambas formas para no depender de cuál use SCM en cada caso.
+    """
+    if "certTypeId" in cert:
+        return cert["certTypeId"], cert.get("certTypeName", "desconocido")
+
+    cert_type = cert.get("certType")
+    if isinstance(cert_type, dict) and "id" in cert_type:
+        return cert_type["id"], cert_type.get("name", "desconocido")
+    if isinstance(cert_type, int):
+        return cert_type, "desconocido (solo id disponible)"
+
+    raise SCMError(
+        "No se pudo determinar el perfil del certificado (certType/certTypeId). "
+        f"Claves disponibles en la respuesta: {sorted(cert.keys())}"
+    )
+
+
+def extraer_sans(cert: dict) -> list[str]:
+    """
+    Extrae los Subject Alternative Names del certificado existente,
+    para no perderlos al renovar. SCM los reporta como texto en
+    certificateDetails.subjectAltNames, con formato:
+    "dNSName=host1, dNSName=host2". Si no vienen (o el campo no
+    existe), cae de vuelta a usar solo el commonName.
+    """
+    common_name = cert.get("commonName", "")
+    raw = cert.get("certificateDetails", {}).get("subjectAltNames", "")
+
+    sans: list[str] = []
+    if raw:
+        for parte in raw.split(","):
+            parte = parte.strip()
+            if "=" in parte:
+                _, valor = parte.split("=", 1)
+                valor = valor.strip()
+                if valor:
+                    sans.append(valor)
+            elif parte:
+                sans.append(parte)
+
+    if common_name and common_name not in sans:
+        sans.insert(0, common_name)
+
+    return sans or ([common_name] if common_name else [])
+
 
 def dias_para_expirar(fecha_expires: str) -> int:
     """fecha_expires viene de SCM como 'MM/DD/YYYY' (ej: '04/08/2027')."""
@@ -563,7 +672,13 @@ def notificar_dominio_no_validado(dominio: dict) -> None:
 
 def _correr_openssl(args: list[str]) -> None:
     log.debug(f"openssl {' '.join(args)}")
-    resultado = subprocess.run(["openssl"] + args, capture_output=True, text=True)
+    # stdin=DEVNULL es clave: si OpenSSL llegara a pedir algo interactivo
+    # (confirmar un campo, una contraseña, etc.), esto lo hace fallar de
+    # inmediato con un error claro en vez de quedarse colgado esperando
+    # una tecla que, al capturar stdout/stderr, ni siquiera se vería.
+    resultado = subprocess.run(
+        ["openssl"] + args, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
     if resultado.returncode != 0:
         log.error(f"openssl {' '.join(args)} -> FALLÓ\n{resultado.stderr}")
         raise OpenSSLError(f"Comando falló: openssl {' '.join(args)}\n{resultado.stderr}")
@@ -604,7 +719,7 @@ def generar_llave_y_csr(
 
     _correr_openssl(["genrsa", "-out", str(ruta_key), str(key_size)])
     _correr_openssl([
-        "req", "-new", "-sha256",
+        "req", "-new", "-batch", "-sha256",
         "-key", str(ruta_key),
         "-config", str(ruta_conf),
         "-out", str(ruta_csr),
@@ -721,8 +836,7 @@ def flujo_renovacion(
 
     org_id = cert_actual["orgId"]
     common_name = cert_actual["commonName"]
-    cert_type_id = cert_actual["certTypeId"]
-    cert_type_name = cert_actual.get("certTypeName", "desconocido")
+    cert_type_id, cert_type_name = extraer_perfil_certificado(cert_actual)
     term_dias = cert_actual.get("term", 199)
 
     log.info(f"Perfil detectado del certificado existente: '{cert_type_name}' "
@@ -734,7 +848,8 @@ def flujo_renovacion(
         log.warning("No se indicó --domain-id: se omite la verificación de "
                     "validación de dominio. Recomendado pasarlo siempre.")
 
-    sans = [common_name]
+    sans = extraer_sans(cert_actual)
+    log.info(f"SANs detectados para la renovación: {sans}")
 
     if not ejecutar:
         log.info("[DRY-RUN] No se va a llamar a OpenSSL ni a /enroll. Esto es lo que se haría:")
@@ -764,29 +879,20 @@ def flujo_renovacion(
     nuevo_ssl_id = resultado_enroll["sslId"]
     log.info(f"Solicitud enviada. Nuevo sslId: {nuevo_ssl_id}")
 
-    formato = os.environ.get("SCM_COLLECT_FORMAT") or cliente.descubrir_formato_collect(nuevo_ssl_id)
+    contenido_hoja, contenido_cadena = cliente.descargar_certificado_completo(nuevo_ssl_id)
 
-    contenido = None
-    for intento in range(1, COLLECT_MAX_INTENTOS + 1):
-        try:
-            contenido = cliente.collect(nuevo_ssl_id, formato)
-            break
-        except CertificadoPendienteError:
-            log.info(f"Certificado aún pendiente (intento {intento}/{COLLECT_MAX_INTENTOS}). "
-                     f"Reintentando en {COLLECT_ESPERA_SEGUNDOS}s...")
-            time.sleep(COLLECT_ESPERA_SEGUNDOS)
+    ruta_pem = directorio_trabajo / f"{common_name}.pem"
+    with open(ruta_pem, "wb") as f:
+        f.write(contenido_hoja)
+        if contenido_cadena:
+            if not contenido_hoja.endswith(b"\n"):
+                f.write(b"\n")
+            f.write(contenido_cadena)
 
-    if contenido is None:
-        raise SCMError(
-            f"El certificado {nuevo_ssl_id} sigue pendiente tras "
-            f"{COLLECT_MAX_INTENTOS} intentos. Revísalo manualmente en el portal."
-        )
+    n_certs = ruta_pem.read_text(encoding="utf-8", errors="ignore").count("BEGIN CERTIFICATE")
+    log.info(f"PEM construido en {ruta_pem} con {n_certs} certificado(s) "
+             f"(hoja{' + cadena' if contenido_cadena else ' — SIN cadena, ver advertencia arriba'}).")
 
-    ruta_p7b = directorio_trabajo / f"{common_name}.p7b"
-    ruta_p7b.write_bytes(contenido)
-    ruta_p7b = normalizar_nombre_archivo(ruta_p7b)
-
-    ruta_pem = convertir_p7b_a_pem(ruta_p7b)
     password = generar_password_pfx()
     ruta_pfx = convertir_pem_a_pfx(ruta_key, ruta_pem, password)
     guardar_password_en_archivo(ruta_pfx, password)
@@ -816,18 +922,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Automatiza la renovación/emisión de certificados en Sectigo SCM."
     )
-    parser.add_argument("--ssl-id", type=int, required=True,
-                         help="sslId del certificado actual a renovar.")
-    parser.add_argument("--referencia", required=True,
+    parser.add_argument("--ssl-id", type=int, default=None,
+                         help="sslId del certificado actual a renovar. No aplica con "
+                              "--solo-subir-netscaler.")
+    parser.add_argument("--referencia", default=None,
                          help="Número de catálogo (solicitud nueva) u OC (renovación), "
-                              "va en el campo de comentarios.")
+                              "va en el campo de comentarios. No aplica con "
+                              "--solo-subir-netscaler.")
     parser.add_argument("--domain-id", type=int, default=None,
                          help="id del dominio en SCM, para validar antes de emitir.")
     parser.add_argument("--ventana-dias", type=int, default=VENTANA_RENOVACION_DIAS_DEFAULT,
                          help=f"Días antes del vencimiento para considerar renovación "
                               f"(default {VENTANA_RENOVACION_DIAS_DEFAULT}).")
     parser.add_argument("--directorio-trabajo", default="./trabajo_certificados",
-                         help="Carpeta donde se generan llave, CSR, p7b, pem y pfx.")
+                         help="Carpeta donde se generan llave, CSR, pem y pfx.")
     parser.add_argument("--log-dir", default="./logs",
                          help="Carpeta donde se escriben los logs (default ./logs).")
     parser.add_argument("--log-level", default="INFO",
@@ -837,17 +945,78 @@ def main() -> None:
     parser.add_argument("--ejecutar", action="store_true",
                          help="Sin esta bandera, el script solo simula (dry-run).")
     parser.add_argument("--subir-netscaler", action="store_true",
-                         help="Además de generar el .pfx, lo sube al NetScaler por NITRO. "
-                              "Requiere NS_HOST/NS_USER/NS_PASSWORD en el entorno y "
-                              "--netscaler-certkey.")
+                         help="Dentro del flujo completo de renovación, además de generar "
+                              "el .pfx, lo sube al NetScaler por NITRO. Requiere "
+                              "NS_HOST/NS_USER/NS_PASSWORD en el entorno y --netscaler-certkey.")
     parser.add_argument("--netscaler-certkey", default=None,
                          help="Nombre exacto del objeto sslcertkey a crear/actualizar en el "
                               "NetScaler (ej: pruebaclm.labsura.com_2026). Se ve con: "
                               "curl .../nitro/v1/config/sslcertkey")
 
+    grupo_solo_subir = parser.add_argument_group(
+        "Modo standalone: subir un .pfx ya generado (sin tocar Sectigo)",
+        "Útil cuando el .pfx se generó en una máquina sin ruta de red al NetScaler "
+        "(ej: se generó en Windows y se sube desde el servidor Linux)."
+    )
+    grupo_solo_subir.add_argument("--solo-subir-netscaler", action="store_true",
+                                   help="Omite todo el ciclo con Sectigo/OpenSSL. Solo sube "
+                                        "un .pfx existente. Requiere --pfx-path y "
+                                        "--netscaler-certkey; no requiere credenciales de SCM.")
+    grupo_solo_subir.add_argument("--pfx-path", default=None,
+                                   help="Ruta al .pfx ya generado (con --solo-subir-netscaler).")
+    grupo_solo_subir.add_argument("--pfx-password", default=None,
+                                   help="Contraseña del .pfx. Si se omite, se lee del archivo "
+                                        "hermano <nombre>.password.txt generado junto al .pfx.")
+
     args = parser.parse_args()
 
     configurar_logging(Path(args.log_dir), args.log_level)
+
+    # ---- Modo standalone: solo subir un .pfx que ya existe ----
+    if args.solo_subir_netscaler:
+        if not args.pfx_path or not args.netscaler_certkey:
+            log.error("--solo-subir-netscaler requiere --pfx-path y --netscaler-certkey.")
+            sys.exit(
+                "--solo-subir-netscaler requiere --pfx-path y --netscaler-certkey.\n"
+                "Ejemplo:\n"
+                "  python renovacion_certificados_sectigo.py --solo-subir-netscaler \\\n"
+                "      --pfx-path trabajo_certificados/pruebaclm.labsura.com.pfx \\\n"
+                "      --netscaler-certkey pruebaclm.labsura.com_2026"
+            )
+
+        ruta_pfx = Path(args.pfx_path)
+        if not ruta_pfx.is_file():
+            log.error(f"No existe el archivo: {ruta_pfx}")
+            sys.exit(f"No existe el archivo: {ruta_pfx}")
+
+        if args.pfx_password:
+            password = args.pfx_password
+        else:
+            ruta_password = ruta_pfx.with_suffix(".password.txt")
+            if not ruta_password.is_file():
+                log.error(f"No se indicó --pfx-password y no existe {ruta_password}.")
+                sys.exit(
+                    f"No se indicó --pfx-password y no existe el archivo hermano "
+                    f"{ruta_password}. Pasa la contraseña explícitamente con --pfx-password, "
+                    f"o asegúrate de copiar también el .password.txt junto al .pfx."
+                )
+            password = ruta_password.read_text(encoding="utf-8").strip()
+            log.info(f"Contraseña leída de {ruta_password}")
+
+        try:
+            subir_a_netscaler(ruta_pfx, password, args.netscaler_certkey)
+            log.info(f"RESULTADO run_id={RUN_ID} estado=OK modo=solo-subir-netscaler "
+                     f"pfx={ruta_pfx} certkey={args.netscaler_certkey}")
+        except NetScalerError as e:
+            log.error(f"RESULTADO run_id={RUN_ID} estado=ERROR mensaje={e}")
+            sys.exit(1)
+        finally:
+            log.info(f"=== Fin de ejecución (run_id={RUN_ID}) ===")
+        return
+
+    # ---- Modo normal: ciclo completo con Sectigo ----
+    if not args.ssl_id or not args.referencia:
+        parser.error("--ssl-id y --referencia son obligatorios fuera de --solo-subir-netscaler.")
 
     config = ConfigSCM.desde_entorno()
     cliente = ClienteSCM(config)
