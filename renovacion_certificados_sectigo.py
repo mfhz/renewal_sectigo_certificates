@@ -493,17 +493,52 @@ class ClienteNetScaler:
                 "fileencoding": "BASE64",
             }]
         }
-        log.debug(f"[NetScaler] POST {self.base_url}/systemfile "
-                  f"filename={nombre_archivo} filelocation={filelocation} "
-                  f"({len(contenido)} bytes)")
-        r = requests.post(f"{self.base_url}/systemfile", json=body,
-                           auth=self.auth, headers=self._headers(),
-                           verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
-        log.debug(f"[NetScaler] -> {r.status_code}")
+        r = self._post_systemfile(body, nombre_archivo, filelocation, len(contenido))
+
+        # NITRO no sobrescribe archivos: si ya existe responde 409 con
+        # errorcode 1642 ("File already exists"). En ese caso se borra
+        # el archivo anterior y se vuelve a subir una sola vez.
+        if r.status_code == 409 and self._errorcode(r) == 1642:
+            log.info(f"[NetScaler] {filelocation}/{nombre_archivo} ya existe: "
+                     f"se elimina y se vuelve a subir.")
+            self.eliminar_archivo_ssl(nombre_archivo, filelocation)
+            r = self._post_systemfile(body, nombre_archivo, filelocation, len(contenido))
+
         if r.status_code not in (200, 201):
             raise NetScalerError(f"No se pudo subir {nombre_archivo} a {filelocation}: "
                                   f"{r.status_code} {r.text}")
         log.info(f"[NetScaler] Archivo subido: {filelocation}/{nombre_archivo}")
+
+    def _post_systemfile(self, body: dict, nombre_archivo: str, filelocation: str,
+                         tamano: int) -> requests.Response:
+        log.debug(f"[NetScaler] POST {self.base_url}/systemfile "
+                  f"filename={nombre_archivo} filelocation={filelocation} ({tamano} bytes)")
+        r = requests.post(f"{self.base_url}/systemfile", json=body,
+                           auth=self.auth, headers=self._headers(),
+                           verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
+        log.debug(f"[NetScaler] -> {r.status_code}")
+        return r
+
+    @staticmethod
+    def _errorcode(r: requests.Response) -> Optional[int]:
+        try:
+            return int(r.json().get("errorcode"))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    def eliminar_archivo_ssl(self, nombre_archivo: str,
+                             filelocation: str = "/nsconfig/ssl") -> None:
+        from urllib.parse import quote
+        url = (f"{self.base_url}/systemfile/{quote(nombre_archivo)}"
+               f"?args=filelocation:{quote(filelocation, safe='')}")
+        log.debug(f"[NetScaler] DELETE {url}")
+        r = requests.delete(url, auth=self.auth, headers=self._headers(),
+                             verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
+        log.debug(f"[NetScaler] -> {r.status_code}")
+        if r.status_code not in (200, 201):
+            raise NetScalerError(f"No se pudo eliminar {filelocation}/{nombre_archivo}: "
+                                  f"{r.status_code} {r.text}")
+        log.info(f"[NetScaler] Archivo anterior eliminado: {filelocation}/{nombre_archivo}")
 
     def certkey_existe(self, certkey: str) -> bool:
         log.debug(f"[NetScaler] GET {self.base_url}/sslcertkey/{certkey}")
@@ -649,13 +684,40 @@ def necesita_renovacion(cert: dict, ventana_dias: int) -> bool:
 
 def verificar_dominio_validado(cliente: ClienteSCM, domain_id: int) -> None:
     dominio = cliente.obtener_dominio(domain_id)
-    estado = dominio.get("status") or dominio.get("delegation", {}).get("status")
-    log.info(f"Dominio '{dominio.get('name')}' (id {domain_id}): estado={estado}")
-    if estado and estado.lower() not in ("validated", "approved", "active"):
+    validacion = dominio.get("validationStatus", "")
+    delegacion = dominio.get("delegationStatus", "desconocido")
+    estado_admin = dominio.get("state", "desconocido")
+    dcv_expira = dominio.get("dcvExpiration", "desconocido")
+
+    log.info(f"Dominio '{dominio.get('name')}' (id {domain_id}): "
+             f"validationStatus={validacion} delegationStatus={delegacion} "
+             f"state={estado_admin} dcvExpiration={dcv_expira}")
+
+    if estado_admin and estado_admin.upper() == "SUSPENDED":
+        log.warning(f"Dominio '{dominio.get('name')}': state=SUSPENDED. En la práctica esto "
+                     f"no bloqueó la emisión en las pruebas realizadas, pero confirma con "
+                     f"Sectigo qué significa exactamente antes de escalar a producción.")
+
+    if validacion and validacion.upper() != "VALIDATED":
         notificar_dominio_no_validado(dominio)
         raise DominioNoValidadoError(
-            f"El dominio {dominio.get('name')} no está validado (estado: {estado})."
+            f"El dominio {dominio.get('name')} no está validado "
+            f"(validationStatus: {validacion})."
         )
+
+    # La validación del dominio (DCV) también expira, independientemente
+    # de la vigencia del certificado. Si está por vencer, avisa — un
+    # fallo aquí bloquearía renovaciones futuras aunque el certificado
+    # en sí esté bien.
+    if dcv_expira and dcv_expira != "desconocido":
+        try:
+            dias_dcv = (datetime.strptime(dcv_expira, "%Y-%m-%d") - datetime.now()).days
+            if dias_dcv <= 60:
+                log.warning(f"Dominio '{dominio.get('name')}': la validación DCV expira en "
+                            f"{dias_dcv} días ({dcv_expira}). Revalidar antes de esa fecha o "
+                            f"las próximas emisiones sobre este dominio van a fallar.")
+        except ValueError:
+            pass
 
 
 def notificar_dominio_no_validado(dominio: dict) -> None:
