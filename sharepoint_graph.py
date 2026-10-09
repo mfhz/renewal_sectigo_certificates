@@ -300,11 +300,13 @@ class ClienteGraph:
     # así que funciona aunque alguien lo tenga abierto. Se trabaja sobre la
     # primera hoja, con los encabezados en la fila 1.
 
-    def leer_excel(self, drive_id: str, ruta: str, encabezados: list[str]) -> HojaExcel:
+    def leer_excel(self, drive_id: str, ruta: str, encabezados: list[str],
+                   escribir_encabezados: bool = True) -> HojaExcel:
         """
         Lee la primera hoja del Excel y se asegura de que tenga los
         encabezados pedidos: si la hoja está vacía los escribe; si ya tiene
         encabezados, respeta su orden y agrega al final los que falten.
+        Con escribir_encabezados=False (simulación) no escribe nada.
         """
         item = self.obtener_item_drive(drive_id, ruta)
         if item is None:
@@ -328,7 +330,7 @@ class ClienteGraph:
         while existentes and existentes[-1] == "":
             existentes.pop()
         columnas = existentes + [h for h in encabezados if h not in existentes]
-        if columnas != existentes:
+        if columnas != existentes and escribir_encabezados:
             self._escribir_rango(url_hoja, 1, 1, [columnas])
 
         # Rango usado, ej. "Sheet1!A1:J7": la primera fila son los encabezados.

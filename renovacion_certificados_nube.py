@@ -145,9 +145,17 @@ def completar_detalle(cliente: ClienteSCM, cert: dict) -> dict:
 
 def procesar_emisiones(cliente: ClienteSCM, graph: ClienteGraph, hoja: HojaExcel,
                        referencia_default: Optional[str], directorio_trabajo: Path, ejecutar: bool,
-                       drive_id: str, ruta_carpeta: str) -> tuple[int, int]:
+                       drive_id: str, ruta_carpeta: str,
+                       solo_dominio: Optional[str] = None) -> tuple[int, int]:
     """Renueva las filas con Estado = "Emitir". Devuelve (emitidos, errores)."""
     aprobadas = [(n, f) for n, f in hoja.filas if es_emitir(f.get("Estado"))]
+    if solo_dominio:
+        omitidas = [f.get("CommonName") for _, f in aprobadas
+                    if str(f.get("CommonName") or "").lower() != solo_dominio.lower()]
+        if omitidas:
+            log.warning(f"[PRUEBA] Se ignoran {len(omitidas)} fila(s) en 'Emitir' de otros dominios: {omitidas}")
+        aprobadas = [(n, f) for n, f in aprobadas
+                     if str(f.get("CommonName") or "").lower() == solo_dominio.lower()]
     log.info(f"[Emisiones] {len(aprobadas)} fila(s) con Estado = 'Emitir'.")
 
     emitidos = errores = 0
@@ -228,44 +236,62 @@ def procesar_emisiones(cliente: ClienteSCM, graph: ClienteGraph, hoja: HojaExcel
 # 2. DETECCIÓN DE CANDIDATOS
 # ============================================================
 
+def _es_issued(cert: dict) -> bool:
+    return (cert.get("status") or "").lower() == "issued" and bool(cert.get("expires"))
+
+
+def _orden_vigencia(cert: dict) -> tuple:
+    """Para elegir el certificado más reciente de un CN: el que vence más tarde y, a igual fecha, el sslId mayor."""
+    return datetime.strptime(cert["expires"], "%m/%d/%Y"), cert.get("sslId", 0)
+
+
 def seleccionar_candidatos(cliente: ClienteSCM, ns: ClienteNetScaler, ventana_dias: int,
-                           ssl_ids_en_excel: set[int]) -> list[dict]:
-    certkeys = ns.listar_certkeys()
-    cns_netscaler = {campo_dn(c.get("subject", ""), "CN").lower() for c in certkeys} - {""}
-    seriales_netscaler = {normalizar_serial(c.get("serial", "")) for c in certkeys} - {""}
-    log.info(f"[NetScaler] {len(certkeys)} sslcertkey leídos para descartar los que ya están instalados.")
+                           ssl_ids_en_excel: set[int], solo_dominio: Optional[str] = None,
+                           ssl_ids_emitidos: frozenset[int] = frozenset()) -> list[dict]:
+    if solo_dominio:
+        # Modo prueba: el dominio de prueba sí está en el NetScaler, así que no se descarta por eso.
+        cns_netscaler: set[str] = set()
+        seriales_netscaler: set[str] = set()
+    else:
+        certkeys = ns.listar_certkeys()
+        cns_netscaler = {campo_dn(c.get("subject", ""), "CN").lower() for c in certkeys} - {""}
+        seriales_netscaler = {normalizar_serial(c.get("serial", "")) for c in certkeys} - {""}
+        log.info(f"[NetScaler] {len(certkeys)} sslcertkey leídos para descartar los que ya están instalados.")
 
     certificados = cliente.listar_certificados()
-    log.info(f"[SCM] {len(certificados)} certificados listados; consultando estado y vencimiento...")
+    log.info(f"[SCM] {len(certificados)} certificados listados.")
+    if solo_dominio:
+        certificados = [c for c in certificados if (c.get("commonName") or "").lower() == solo_dominio.lower()]
+        log.info(f"[PRUEBA] {len(certificados)} certificado(s) de '{solo_dominio}'.")
     certificados = [completar_detalle(cliente, c) for c in certificados]
 
+    # Por cada CN solo cuenta el certificado emitido más reciente: los anteriores ya fueron reemplazados.
     por_cn: dict[str, list[dict]] = {}
     for c in certificados:
         por_cn.setdefault((c.get("commonName") or "").lower(), []).append(c)
+    vigente_por_cn = {cn: max(issued, key=_orden_vigencia)
+                      for cn, lista in por_cn.items()
+                      if (issued := [c for c in lista if _es_issued(c)])}
 
     candidatos = []
-    for cert in certificados:
+    for cn_clave, cert in vigente_por_cn.items():
         cn = cert.get("commonName") or ""
-        if (cert.get("status") or "").lower() != "issued" or not cert.get("expires"):
-            continue
         dias = dias_para_expirar(cert["expires"])
         if dias > ventana_dias or cert["sslId"] in ssl_ids_en_excel:
+            continue
+
+        # Un certificado que este script emitió y que nació ya dentro de la ventana (vigencia <=
+        # ventana, típico al probar con ventanas largas) no se vuelve a proponer de inmediato.
+        if cert["sslId"] in ssl_ids_emitidos and (a_entero(cert.get("term")) or 0) <= ventana_dias:
+            log.info(f"  Omitido {cn} (sslId={cert['sslId']}): lo acaba de emitir este script.")
             continue
 
         if cn.lower() in cns_netscaler or normalizar_serial(cert.get("serialNumber", "")) in seriales_netscaler:
             log.debug(f"  Omitido {cn} (sslId={cert['sslId']}): está en el NetScaler.")
             continue
 
-        otros = [o for o in por_cn.get(cn.lower(), []) if o.get("sslId") != cert.get("sslId")]
-        ya_renovado = any(
-            (o.get("status") or "").lower() in ESTADOS_SCM_EN_CURSO
-            or ((o.get("status") or "").lower() == "issued" and o.get("expires")
-                and dias_para_expirar(o["expires"]) > ventana_dias)
-            for o in otros
-        )
-        if ya_renovado:
-            log.info(f"  Omitido {cn} (sslId={cert['sslId']}): ya tiene otro certificado "
-                     f"emitido o en curso con el mismo CN.")
+        if any((o.get("status") or "").lower() in ESTADOS_SCM_EN_CURSO for o in por_cn[cn_clave]):
+            log.info(f"  Omitido {cn} (sslId={cert['sslId']}): ya tiene una solicitud en curso en Sectigo.")
             continue
 
         log.info(f"  Nuevo candidato: {cn} (sslId={cert['sslId']}) vence {cert['expires']} -> {dias} días")
@@ -284,12 +310,17 @@ def main() -> None:
                         help="OC por defecto para las filas aprobadas que no tengan Referencia.")
     parser.add_argument("--ejecutar", action="store_true",
                         help="Sin esta bandera solo simula (no emite ni escribe en el Excel).")
+    parser.add_argument("--solo-dominio", default=None,
+                        help="Modo prueba: trabaja únicamente con este commonName (ej. pruebaclm.labsura.com), "
+                             "en la detección y en las emisiones, sin descartarlo por estar en el NetScaler.")
     parser.add_argument("--directorio-trabajo", default="./trabajo_certificados_nube")
     parser.add_argument("--log-dir", default="./logs")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
     configurar_logging(Path(args.log_dir), args.log_level, "renovacion_certificados_nube.log")
+    if args.solo_dominio:
+        log.warning(f"[PRUEBA] Modo prueba: solo se trabaja con '{args.solo_dominio}'.")
 
     sp = requerir_entorno("SP_DRIVE_ID", "SP_RUTA_CARPETA_NUBE", "SP_RUTA_EXCEL_NUBE")
     drive_id = sp["SP_DRIVE_ID"]
@@ -303,15 +334,19 @@ def main() -> None:
     try:
         if graph.obtener_item_drive(drive_id, ruta_carpeta) is None:
             raise SharePointError(f"No existe la carpeta '{ruta_carpeta}' en la biblioteca (SP_RUTA_CARPETA_NUBE).")
-        hoja = graph.leer_excel(drive_id, ruta_excel, ENCABEZADOS_EXCEL)
+        hoja = graph.leer_excel(drive_id, ruta_excel, ENCABEZADOS_EXCEL, args.ejecutar)
         log.info(f"[SharePoint] Excel '{ruta_excel}' leído: {len(hoja.filas)} fila(s).")
 
         emitidos, errores = procesar_emisiones(
             cliente, graph, hoja, args.referencia, Path(args.directorio_trabajo),
-            args.ejecutar, drive_id, ruta_carpeta)
+            args.ejecutar, drive_id, ruta_carpeta, args.solo_dominio)
 
+        # Se vuelve a leer el Excel: las emisiones de arriba acaban de escribir SslIdNuevo.
+        hoja = graph.leer_excel(drive_id, ruta_excel, ENCABEZADOS_EXCEL, args.ejecutar)
         ssl_ids_en_excel = {a_entero(f.get("SslId")) for _, f in hoja.filas} - {None}
-        candidatos = seleccionar_candidatos(cliente, ns, args.ventana_dias, ssl_ids_en_excel)
+        ssl_ids_emitidos = frozenset({a_entero(f.get("SslIdNuevo")) for _, f in hoja.filas} - {None})
+        candidatos = seleccionar_candidatos(cliente, ns, args.ventana_dias, ssl_ids_en_excel,
+                                            args.solo_dominio, ssl_ids_emitidos)
         nuevas = [{
             "SslId": c["sslId"],
             "CommonName": c.get("commonName", ""),
