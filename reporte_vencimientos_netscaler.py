@@ -18,9 +18,9 @@ SharePoint, con aprobación manual por la columna "Estado":
          que son de la persona.
        - Los items existentes se refrescan aunque ya no estén por vencer,
          para que DiasParaVencer no quede desactualizado.
-       - Un item "Emitido" que vuelve a entrar en la ventana (el
-         certificado renovado está por vencer otra vez) vuelve a
-         "Pendiente".
+       - Un item "Emitido" vuelve a "Pendiente" cuando el certificado
+         renovado está por vencer otra vez (la emisión fue antes de que
+         ese certificado entrara en la ventana).
        - Si un certkey ya no existe en el NetScaler, se marca
          EstadoNetScaler = "No existe en NetScaler".
        - Los certificados de CA no tienen llave privada en el NetScaler y
@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -248,6 +248,27 @@ def procesar_emisiones(gestor: GestorLista, cliente: ClienteSCM, indice_sectigo:
     return emitidos, errores
 
 
+def inicia_ciclo_nuevo(gestor: GestorLista, item: dict, dias: Optional[int], ventana_dias: int,
+                       ahora: datetime) -> bool:
+    """
+    Un item "Emitido" vuelve a "Pendiente" cuando el certificado instalado
+    entra otra vez en la ventana, pero solo si la emisión fue ANTES de que
+    ese certificado entrara en la ventana. Así, uno recién emitido no se
+    devuelve a Pendiente cuando la ventana es más larga que su vigencia
+    (ej. --ventana-dias 400 con certificados de 199 días).
+    """
+    if str(gestor.campo(item, "Estado") or "").strip() != ESTADO_EMITIDO:
+        return False
+    if dias is None or dias > ventana_dias:
+        return False
+    try:
+        fecha_emision = datetime.strptime(str(gestor.campo(item, "FechaEmision")), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return True  # Emitido sin fecha de emisión: no hay cómo saber, se trata como ciclo nuevo
+    entrada_en_ventana = ahora.replace(tzinfo=None) + timedelta(days=dias - ventana_dias)
+    return fecha_emision < entrada_en_ventana
+
+
 def sincronizar_reporte(gestor: GestorLista, ns: ClienteNetScaler, indice_sectigo: dict[str, int],
                         ventana_dias: int, ejecutar: bool) -> int:
     """Crea/actualiza los items del reporte. Devuelve la cantidad de errores."""
@@ -296,10 +317,7 @@ def sincronizar_reporte(gestor: GestorLista, ns: ClienteNetScaler, indice_sectig
             if item is None:
                 gestor.crear(campos)
                 continue
-            # Un certificado ya emitido que vuelve a estar por vencer arranca un ciclo nuevo.
-            dias = campos.get("DiasParaVencer")
-            if (str(gestor.campo(item, "Estado") or "").strip() == ESTADO_EMITIDO
-                    and dias is not None and dias <= ventana_dias):
+            if inicia_ciclo_nuevo(gestor, item, campos.get("DiasParaVencer"), ventana_dias, ahora):
                 campos = {**campos, "Estado": ESTADO_PENDIENTE, "Detalle": ""}
             gestor.actualizar(item["id"], campos)
         except SharePointError as e:
