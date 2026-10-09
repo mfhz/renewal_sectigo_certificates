@@ -103,6 +103,7 @@ import argparse
 import logging
 import logging.handlers
 import os
+import re
 import secrets
 import string
 import stat
@@ -697,6 +698,17 @@ def extraer_sans(cert: dict) -> list[str]:
     return sans or ([common_name] if common_name else [])
 
 
+def campo_dn(dn: str, clave: str) -> str:
+    """Extrae un atributo (CN, O...) de un subject/issuer como 'C=CO,O=Sura,CN=host.sura.com'."""
+    m = re.search(rf"(?:^|[,/]\s*){clave}=([^,/]+)", dn or "")
+    return m.group(1).strip() if m else ""
+
+
+def normalizar_serial(serial: str) -> str:
+    """Deja el número de serie comparable entre SCM y NetScaler: solo hex, en mayúscula, sin ceros a la izquierda."""
+    return re.sub(r"[^0-9A-Fa-f]", "", serial or "").upper().lstrip("0")
+
+
 def dias_para_expirar(fecha_expires: str) -> int:
     """fecha_expires viene de SCM como 'MM/DD/YYYY' (ej: '04/08/2027')."""
     fecha = datetime.strptime(fecha_expires, "%m/%d/%Y")
@@ -907,6 +919,21 @@ def guardar_password_en_archivo(ruta_pfx: Path, password: str) -> Path:
 # FLUJO PRINCIPAL
 # ============================================================
 
+# Columna "Estado" de la lista de SharePoint y del Excel de nube. La
+# persona aprueba escribiendo "Emitir"; el resto los escribe el script.
+# "En proceso" se marca ANTES de llamar a /enroll: si la corrida se cae
+# a mitad de camino, ese registro no se vuelve a emitir solo.
+ESTADO_PENDIENTE = "Pendiente"
+ESTADO_EMITIR = "Emitir"
+ESTADO_EN_PROCESO = "En proceso"
+ESTADO_EMITIDO = "Emitido"
+ESTADO_ERROR = "Error"
+
+
+def es_emitir(valor) -> bool:
+    return str(valor or "").strip().lower() == ESTADO_EMITIR.lower()
+
+
 @dataclass
 class ResultadoRenovacion:
     ssl_id_nuevo: int
@@ -925,10 +952,15 @@ def flujo_renovacion(
     ejecutar: bool,
     subir_netscaler: bool = False,
     netscaler_certkey: Optional[str] = None,
+    omitir_ventana: bool = False,
 ) -> Optional[ResultadoRenovacion]:
+    """
+    omitir_ventana=True renueva aunque el certificado no esté dentro de la
+    ventana: se usa cuando una persona ya aprobó la emisión ("Emitir").
+    """
     cert_actual = cliente.obtener_certificado(ssl_id_actual)
 
-    if not necesita_renovacion(cert_actual, ventana_dias):
+    if not necesita_renovacion(cert_actual, ventana_dias) and not omitir_ventana:
         log.info("Todavía no entra en la ventana de renovación. No se hace nada.")
         return None
 

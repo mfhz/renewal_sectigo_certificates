@@ -89,6 +89,16 @@ class ListaSharePoint:
     nombre: str
 
 
+@dataclass
+class HojaExcel:
+    ruta: str
+    url_hoja: str
+    nombre: str
+    encabezados: list[str]
+    filas: list[tuple[int, dict]]  # (número de fila en Excel, {encabezado: valor})
+    ultima_fila: int
+
+
 class ClienteGraph:
     def __init__(self, config: ConfigGraph):
         self.config = config
@@ -285,17 +295,16 @@ class ClienteGraph:
         return r.json()
 
     # ---- Excel (API de workbook de Graph, sin librerías extra) --------
+    #
+    # Se edita el .xlsx en línea: no se descarga ni se reemplaza el archivo,
+    # así que funciona aunque alguien lo tenga abierto. Se trabaja sobre la
+    # primera hoja, con los encabezados en la fila 1.
 
-    def agregar_filas_excel(self, drive_id: str, ruta: str, encabezados: list[str],
-                            filas: list[dict]) -> None:
+    def leer_excel(self, drive_id: str, ruta: str, encabezados: list[str]) -> HojaExcel:
         """
-        Agrega filas al final de la primera hoja de un .xlsx que ya existe en
-        SharePoint, editándolo en línea con la API de Excel de Graph: no se
-        descarga ni se reemplaza el archivo, así que funciona aunque alguien
-        lo tenga abierto.
-
-        Si la hoja está vacía, escribe los encabezados en la fila 1. Si ya
-        tiene encabezados, respeta su orden y agrega al final los que falten.
+        Lee la primera hoja del Excel y se asegura de que tenga los
+        encabezados pedidos: si la hoja está vacía los escribe; si ya tiene
+        encabezados, respeta su orden y agrega al final los que falten.
         """
         item = self.obtener_item_drive(drive_id, ruta)
         if item is None:
@@ -315,23 +324,45 @@ class ClienteGraph:
         valores = usado.get("values") or [[""]]
         hoja_vacia = all(v in ("", None) for fila in valores for v in fila)
 
-        existentes = [] if hoja_vacia else [str(v) for v in valores[0]]
+        existentes = [] if hoja_vacia else [str(v).strip() for v in valores[0]]
         while existentes and existentes[-1] == "":
             existentes.pop()
         columnas = existentes + [h for h in encabezados if h not in existentes]
         if columnas != existentes:
-            self._escribir_rango(url_hoja, 1, [columnas])
+            self._escribir_rango(url_hoja, 1, 1, [columnas])
 
-        # Última fila usada: sale de la dirección, ej. "Sheet1!A1:J7" -> 7
-        ultima_fila = 1 if hoja_vacia else int(re.findall(r"(\d+)$", usado["address"])[0])
-        datos = [["" if fila.get(c) is None else fila.get(c) for c in columnas] for fila in filas]
-        self._escribir_rango(url_hoja, ultima_fila + 1, datos)
-        log.info(f"[SharePoint] {len(filas)} fila(s) agregada(s) a {ruta} (hoja '{hoja['name']}').")
+        # Rango usado, ej. "Sheet1!A1:J7": la primera fila son los encabezados.
+        filas: list[tuple[int, dict]] = []
+        ultima_fila = 1
+        if not hoja_vacia:
+            numeros = [int(n) for n in re.findall(r"[A-Z]+(\d+)", usado["address"].split("!")[-1])]
+            primera_fila, ultima_fila = numeros[0], numeros[-1]
+            for i, valores_fila in enumerate(valores[1:], start=primera_fila + 1):
+                if any(v not in ("", None) for v in valores_fila):
+                    filas.append((i, dict(zip(existentes, valores_fila))))
 
-    def _escribir_rango(self, url_hoja: str, fila_inicio: int, valores: list[list]) -> None:
+        return HojaExcel(ruta, url_hoja, hoja["name"], columnas, filas, ultima_fila)
+
+    def agregar_filas_excel(self, hoja: HojaExcel, filas: list[dict]) -> None:
+        if not filas:
+            return
+        datos = [["" if fila.get(c) is None else fila.get(c) for c in hoja.encabezados] for fila in filas]
+        self._escribir_rango(hoja.url_hoja, hoja.ultima_fila + 1, 1, datos)
+        hoja.ultima_fila += len(filas)
+        log.info(f"[SharePoint] {len(filas)} fila(s) agregada(s) a {hoja.ruta} (hoja '{hoja.nombre}').")
+
+    def actualizar_fila_excel(self, hoja: HojaExcel, numero_fila: int, cambios: dict) -> None:
+        """Escribe solo las celdas que cambian, para no pisar lo que una persona haya editado en esa fila."""
+        for columna, valor in cambios.items():
+            indice = hoja.encabezados.index(columna) + 1
+            self._escribir_rango(hoja.url_hoja, numero_fila, indice, [["" if valor is None else valor]])
+
+    def _escribir_rango(self, url_hoja: str, fila_inicio: int, columna_inicio: int,
+                        valores: list[list]) -> None:
         ancho = max(len(f) for f in valores)
         valores = [f + [""] * (ancho - len(f)) for f in valores]
-        direccion = f"A{fila_inicio}:{_letra_columna(ancho)}{fila_inicio + len(valores) - 1}"
+        direccion = (f"{_letra_columna(columna_inicio)}{fila_inicio}:"
+                     f"{_letra_columna(columna_inicio + ancho - 1)}{fila_inicio + len(valores) - 1}")
         r = self.request("PATCH", f"{url_hoja}/range(address='{direccion}')", json={"values": valores})
         if r.status_code != 200:
             raise SharePointError(f"No se pudo escribir el rango {direccion}: {r.status_code} {r.text}")
