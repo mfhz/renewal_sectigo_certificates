@@ -182,9 +182,10 @@ RUN_ID = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
 log = logging.getLogger("renovacion_sectigo")
 
 
-def configurar_logging(directorio_logs: Path, nivel: str) -> None:
+def configurar_logging(directorio_logs: Path, nivel: str,
+                       nombre_archivo: str = "renovacion_sectigo.log") -> None:
     directorio_logs.mkdir(parents=True, exist_ok=True)
-    ruta_log = directorio_logs / "renovacion_sectigo.log"
+    ruta_log = directorio_logs / nombre_archivo
 
     formato = logging.Formatter(
         f"%(asctime)s\trun_id={RUN_ID}\t%(levelname)s\t%(message)s"
@@ -313,6 +314,23 @@ class ClienteSCM:
         if r.status_code != 200:
             raise SCMError(f"No se pudo leer el certificado {ssl_id}: {r.status_code} {r.text}")
         return r.json()
+
+    def listar_certificados(self, tamano_pagina: int = 200, **filtros) -> list[dict]:
+        """
+        Recorre /api/ssl/v1 paginando con size/position. Los filtros
+        (status, orgId, commonName...) se pasan tal cual como query params.
+        """
+        certificados: list[dict] = []
+        posicion = 0
+        while True:
+            r = self._get("/api/ssl/v1", params={"size": tamano_pagina, "position": posicion, **filtros})
+            if r.status_code != 200:
+                raise SCMError(f"No se pudo listar certificados: {r.status_code} {r.text}")
+            pagina = r.json()
+            certificados.extend(pagina)
+            if len(pagina) < tamano_pagina:
+                return certificados
+            posicion += tamano_pagina
 
     def listar_perfiles(self, org_id: int) -> list[dict]:
         r = self._get("/api/ssl/v1/types", params={"organizationId": org_id})
@@ -539,6 +557,16 @@ class ClienteNetScaler:
             raise NetScalerError(f"No se pudo eliminar {filelocation}/{nombre_archivo}: "
                                   f"{r.status_code} {r.text}")
         log.info(f"[NetScaler] Archivo anterior eliminado: {filelocation}/{nombre_archivo}")
+
+    def listar_certkeys(self) -> list[dict]:
+        log.debug(f"[NetScaler] GET {self.base_url}/sslcertkey")
+        r = requests.get(f"{self.base_url}/sslcertkey",
+                          auth=self.auth, headers=self._headers(),
+                          verify=self.config.verificar_tls, timeout=TIMEOUT_HTTP_SEGUNDOS)
+        log.debug(f"[NetScaler] -> {r.status_code}")
+        if r.status_code != 200:
+            raise NetScalerError(f"No se pudo listar los sslcertkey: {r.status_code} {r.text}")
+        return r.json().get("sslcertkey", [])
 
     def certkey_existe(self, certkey: str) -> bool:
         log.debug(f"[NetScaler] GET {self.base_url}/sslcertkey/{certkey}")
@@ -879,6 +907,14 @@ def guardar_password_en_archivo(ruta_pfx: Path, password: str) -> Path:
 # FLUJO PRINCIPAL
 # ============================================================
 
+@dataclass
+class ResultadoRenovacion:
+    ssl_id_nuevo: int
+    common_name: str
+    ruta_pfx: Path
+    ruta_password: Path
+
+
 def flujo_renovacion(
     cliente: ClienteSCM,
     ssl_id_actual: int,
@@ -889,7 +925,7 @@ def flujo_renovacion(
     ejecutar: bool,
     subir_netscaler: bool = False,
     netscaler_certkey: Optional[str] = None,
-) -> Optional[Path]:
+) -> Optional[ResultadoRenovacion]:
     cert_actual = cliente.obtener_certificado(ssl_id_actual)
 
     if not necesita_renovacion(cert_actual, ventana_dias):
@@ -957,7 +993,7 @@ def flujo_renovacion(
 
     password = generar_password_pfx()
     ruta_pfx = convertir_pem_a_pfx(ruta_key, ruta_pem, password)
-    guardar_password_en_archivo(ruta_pfx, password)
+    ruta_password = guardar_password_en_archivo(ruta_pfx, password)
 
     if subir_netscaler:
         if not netscaler_certkey:
@@ -973,7 +1009,7 @@ def flujo_renovacion(
              f"commonName={common_name} estado=OK archivo_pfx={ruta_pfx} "
              f"subido_netscaler={subir_netscaler}")
 
-    return ruta_pfx
+    return ResultadoRenovacion(nuevo_ssl_id, common_name, ruta_pfx, ruta_password)
 
 
 # ============================================================
